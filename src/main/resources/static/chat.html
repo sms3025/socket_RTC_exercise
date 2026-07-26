@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>[1단계] STOMP 채팅 연습</title>
+  <!--
+    STOMP를 브라우저에서 쓰려면 두 개의 라이브러리가 필요하다:
+      - SockJS      : WebSocket 연결(+폴백)을 만들어 주는 라이브러리 (서버의 .withSockJS() 와 짝)
+      - StompJS     : 그 연결 위에서 SUBSCRIBE / SEND 같은 STOMP 명령을 쓰게 해주는 라이브러리
+    실무에선 npm으로 설치하지만, 연습용이라 CDN으로 간단히 불러온다.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7/bundles/stomp.umd.min.js"></script>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+    #log { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: 10px; margin: 10px 0; }
+    input, button { padding: 6px; font-size: 14px; }
+    .sys { color: #888; font-style: italic; }
+    .whisper { color: #a020f0; }               /* 귓속말은 보라색으로 구분 */
+    fieldset { margin: 10px 0; border: 1px solid #ddd; border-radius: 6px; }
+    legend { font-size: 13px; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>[1단계] STOMP 채팅 연습</h2>
+
+  <div>
+    방 번호: <input id="roomId" value="1" size="4" />
+    닉네임: <input id="nickname" value="사용자" size="8" />
+    <button onclick="connect()">입장</button>
+  </div>
+
+  <div id="log"></div>
+
+  <!-- 방 전체 채팅 (broadcast) -->
+  <fieldset>
+    <legend>전체 채팅 (방 전체에게 방송)</legend>
+    <input id="msg" placeholder="메시지를 입력하고 Enter" size="40" onkeydown="if(event.key==='Enter') send()" />
+    <button onclick="send()">전송</button>
+  </fieldset>
+
+  <!-- [3단계 추가] 1:1 귓속말 (특정 상대에게만) -->
+  <fieldset>
+    <legend>귓속말 (지정한 한 명에게만)</legend>
+    받는 사람:
+    <input id="whisperTarget" list="userList" placeholder="상대 닉네임" size="10" />
+    <datalist id="userList"></datalist>  <!-- 대화에서 본 닉네임을 자동완성 후보로 채운다 -->
+    <input id="whisperMsg" placeholder="귓속말 내용" size="26" onkeydown="if(event.key==='Enter') whisper()" />
+    <button onclick="whisper()">귓속말</button>
+  </fieldset>
+
+<script>
+  let stompClient = null;   // STOMP 클라이언트 객체
+  let roomId = null;
+  let nickname = null;
+
+  const logBox = document.getElementById('log');
+  function log(text, cls = null) {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;   // 'sys'(시스템) 또는 'whisper'(귓속말)
+    div.textContent = text;
+    logBox.appendChild(div);
+    logBox.scrollTop = logBox.scrollHeight; // 항상 맨 아래로 스크롤
+  }
+
+  // 대화에서 본 닉네임들을 모아두는 집합 → 귓속말 상대 자동완성에 쓴다.
+  const seenUsers = new Set();
+  function rememberUser(name) {
+    if (!name || name === nickname || seenUsers.has(name)) return;
+    seenUsers.add(name);
+    const opt = document.createElement('option');
+    opt.value = name;
+    document.getElementById('userList').appendChild(opt);
+  }
+
+  function connect() {
+    roomId = document.getElementById('roomId').value;
+    nickname = document.getElementById('nickname').value;
+
+    // 1) 서버의 STOMP 엔드포인트(/ws)로 연결 생성. WebSocketConfig의 addEndpoint("/ws")와 짝.
+    //    '/ws' 는 '상대 경로'라서 현재 페이지 주소를 그대로 따라간다.
+    //      · https://localhost:8443 에서 열면  →  자동으로 wss://localhost:8443/ws (암호화 연결!)
+    //
+    //    [3단계 추가] '?username=닉네임' 을 붙여 접속한다.
+    //      → 서버가 이 값을 내 연결의 이름표(Principal)로 삼는다.
+    //      → 그래야 누군가 나에게 귓속말(convertAndSendToUser)을 보낼 수 있다.
+    //      → 한글 닉네임이 깨지지 않도록 encodeURIComponent 로 감싼다.
+    stompClient = new StompJs.Client({
+      webSocketFactory: () => new SockJS('/ws?username=' + encodeURIComponent(nickname)),
+      // 연결이 끊기면 5초 뒤 자동 재연결 (실시간 서비스에서 매우 중요한 옵션)
+      reconnectDelay: 5000,
+    });
+
+    // 2) 연결 성공 시 콜백
+    stompClient.onConnect = () => {
+      log('서버에 연결되었습니다.', 'sys');
+
+      // 3-A) 방 전체 채팅 구독. 서버가 /topic/chat/{roomId} 로 방송하는 걸 모두가 받는다.
+      stompClient.subscribe('/topic/chat/' + roomId, (frame) => {
+        const chat = JSON.parse(frame.body);
+        rememberUser(chat.sender);   // 말한 사람을 귓속말 후보로 기억
+        if (chat.type === 'TALK') {
+          log(chat.sender + ' : ' + chat.message);
+        } else {
+          // ENTER / LEAVE 같은 시스템 메시지
+          log(chat.message, 'sys');
+        }
+      });
+
+      // 3-B) [3단계 추가] 나에게만 오는 귓속말 구독. 주소에 '/user' 가 붙은 게 핵심.
+      //      서버의 convertAndSendToUser(target, "/queue/chat", ...) 와 짝을 이룬다.
+      //      → 이 방/이 서버의 다른 누구도 이 메시지를 볼 수 없다. (나에게만 배달)
+      stompClient.subscribe('/user/queue/chat', (frame) => {
+        const chat = JSON.parse(frame.body);
+        rememberUser(chat.sender);
+        if (chat.sender === nickname) {
+          // 내가 보낸 귓속말이 나에게도 돌아온 경우 (보낸 기록 표시용)
+          log('(나 → ' + chat.target + ') ' + chat.message, 'whisper');
+        } else {
+          // 남이 나에게 보낸 귓속말
+          log('(' + chat.sender + ' → 나) ' + chat.message, 'whisper');
+        }
+      });
+
+      // 4) 입장 사실을 방에 알림. 목적지가 /app 으로 시작 → 서버의 @MessageMapping 실행됨.
+      publish('ENTER', '');
+    };
+
+    // 연결 에러 로깅 (디버깅에 유용)
+    stompClient.onStompError = (frame) => log('에러: ' + frame.headers['message'], 'sys');
+
+    // 5) 실제 연결 시작
+    stompClient.activate();
+  }
+
+  // 방 전체 채팅 발행(SEND) 함수
+  function publish(type, message) {
+    stompClient.publish({
+      destination: '/app/chat/' + roomId,   // WebSocketConfig의 "/app" 접두어 + 컨트롤러의 "/chat/{roomId}"
+      body: JSON.stringify({ type, sender: nickname, message }),
+    });
+  }
+
+  function send() {
+    const input = document.getElementById('msg');
+    if (!input.value.trim() || !stompClient) return;
+    publish('TALK', input.value);
+    input.value = '';
+  }
+
+  // [3단계 추가] 귓속말 발행 함수 → /app/chat/{roomId}/whisper 로 SEND
+  function whisper() {
+    const target = document.getElementById('whisperTarget').value.trim();
+    const input = document.getElementById('whisperMsg');
+    if (!target || !input.value.trim() || !stompClient) return;
+    stompClient.publish({
+      destination: '/app/chat/' + roomId + '/whisper',
+      // target(받는 사람)을 함께 실어 보낸다. 서버가 이 값으로 그 사람에게만 전달한다.
+      body: JSON.stringify({ type: 'WHISPER', sender: nickname, target, message: input.value }),
+    });
+    input.value = '';
+  }
+
+  // 브라우저 탭을 닫을 때 퇴장 알림 (best-effort)
+  window.addEventListener('beforeunload', () => {
+    if (stompClient && stompClient.connected) publish('LEAVE', '');
+  });
+</script>
+</body>
+</html>
