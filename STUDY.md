@@ -150,6 +150,36 @@ livekit-server --dev
 > 나가는 걸 확인할 수 있고, LiveKit 서버 콘솔에서는 참가자 입장/트랙 발행 로그가 흐른다.
 > Mesh(2단계)와 달리 탭을 3~4개로 늘려도 각 탭의 업로드가 1개로 유지되는 게 SFU 의 핵심이다.
 
+### 5단계 — 카메라/마이크 on/off 와 서버 강제 제어 (`livekit.html`, `LiveKitAdminController`)
+- 관련 파일: `livekit/LiveKitAdminController.java`, `static/livekit.html`(미디어 버튼 + 진행자 패널)
+- **두 종류의 "끄기"를 구분하는 게 핵심이다:**
+
+  | 구분 | 누가 | API | 위치 |
+  |------|------|-----|------|
+  | **내가 끄기** | 참가자 본인 | `localParticipant.setCameraEnabled/​setMicrophoneEnabled` | `livekit.html` `toggleCamera/toggleMic` |
+  | **강제로 끄기** | 서버(진행자) | `RoomServiceClient.mutePublishedTrack` | `LiveKitAdminController` |
+
+- **(내가 끄기)** LiveKit SDK 로 내 트랙을 mute/unmute 한다. 현재 상태는 `isCameraEnabled` /
+  `isMicrophoneEnabled` 로 읽어 버튼 글자를 맞춘다.
+- **(서버 강제 제어)** 토큰 발급(4단계)은 "브라우저에게 입장권을 주는" 일이었지만, 강제 제어는
+  **우리 서버가 LiveKit 서버에게 직접 관리 명령(REST)을 보내는** 일이다(방향이 반대).
+  - 절차: `getParticipant` 로 대상의 트랙 목록을 받고 → source(카메라/마이크)가 맞는 트랙의
+    `trackSid` 를 찾아 → `mutePublishedTrack(room, identity, trackSid, muted)` 호출.
+  - 대상 브라우저는 아무 코드도 안 짰지만 SDK 가 `TrackMuted` 이벤트를 받아 **버튼이 저절로
+    "켜기"로 바뀐다.** SFU 라서 서버가 미디어 경로에 있어 강제가 통한다(Mesh 에선 불가능).
+- 핵심 질문:
+  - "내가 끄기"와 "서버가 강제로 끄기"는 각각 어디서(클라/서버) 이뤄지는가?
+  - `mutePublishedTrack` 에 왜 `trackSid` 가 필요한가? identity 만으로 부족한 이유는?
+  - 강제 "켜기(unmute)"가 강제 "끄기"보다 위험한 이유는? (동의 없는 마이크 켜기 = 도청)
+
+> **테스트 방법**: 탭 2개(예: `alice`, `bob`)로 같은 방에 입장한 뒤, alice 탭의
+> **🛡️ 서버 강제 제어** 패널에 대상 이름 `bob`, 장치 `마이크`, **강제 끄기**를 누른다.
+> → bob 탭의 "🎤 마이크 끄기" 버튼이 저절로 "🎤 마이크 켜기"로 바뀌면 성공.
+> 우리 서버 콘솔엔 `[LIVEKIT-ADMIN] 강제 OFF: room=1 identity=bob source=microphone ...` 로그가 찍힌다.
+>
+> ⚠️ **강제 켜기(ON)** 는 프라이버시 정책상 LiveKit 서버가 거부할 수 있다(도청 방지).
+> 그럴 땐 응답이 실패로 오는데, 이는 버그가 아니라 의도된 보안 동작이다.
+
 ## 이 연습이 마피아 게임과 어떻게 이어지나
 
 | 연습에서 배운 것              | 마피아 게임에서의 쓰임                                  |
@@ -160,6 +190,8 @@ livekit-server --dev
 | WebRTC Mesh 연결             | 소규모(4~6명) 플레이어의 실시간 얼굴(화상) 연결          |
 | 시그널링 서버(STOMP 재사용)  | Mesh 화상 연결을 맺기 위한 신호 통로                    |
 | LiveKit SFU + 토큰 발급      | 8~10명 대규모 방의 화상, 권한 기반 입장(관전자/마피아 통제) |
+| 카메라/마이크 on/off (본인)  | 참가자가 스스로 자기 얼굴/목소리를 켜고 끔                |
+| 서버 강제 mute(`mutePublishedTrack`) | 죽은 사람 마이크 강제 OFF, 밤엔 전원 카메라 강제 OFF |
 
 ## 다음 단계로 확장해볼 것 (익숙해진 뒤)
 1. 방 참가자 목록/입장·퇴장을 서버가 메모리에 관리 (`WebSocketEventListener` 로 연결 종료 감지)
@@ -185,9 +217,10 @@ src/main/java/com/socket/test/example/
 ├── signal/                         # 2단계: WebRTC 시그널링 (+3단계 1:1 타겟)
 │   ├── SignalController.java
 │   └── SignalMessage.java
-└── livekit/                        # 4단계: LiveKit SFU (토큰 발급소 역할)
+└── livekit/                        # 4·5단계: LiveKit SFU (토큰 발급 + 강제 제어)
     ├── LiveKitProperties.java      # livekit.* 설정값(서버 주소/키/시크릿)
-    ├── LiveKitTokenController.java # /api/livekit/token → 입장권(JWT) 발급
+    ├── LiveKitTokenController.java # (4단계) /api/livekit/token → 입장권(JWT) 발급
+    ├── LiveKitAdminController.java # (5단계) /api/livekit/mute → 카메라/마이크 강제 on/off
     └── TokenResponse.java          # 토큰 발급 응답 DTO
 
 src/main/resources/
@@ -196,7 +229,7 @@ src/main/resources/
 └── static/
     ├── chat.html                   # 1단계 채팅 + 3단계 귓속말 UI
     ├── webrtc.html                 # 2단계 화상 테스트 페이지 (Mesh)
-    └── livekit.html                # 4단계 화상 테스트 페이지 (SFU/LiveKit)
+    └── livekit.html                # 4·5단계 화상 페이지 (SFU + 미디어 on/off + 강제 제어)
 
 src/test/
 ├── java/com/socket/test/example/PrivateMessagingTest.java  # (3단계) 1:1 격리 검증

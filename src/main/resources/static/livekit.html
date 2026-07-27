@@ -37,6 +37,41 @@
   </div>
   <div id="status">대기 중…</div>
 
+  <!-- ────────────────────────────────────────────────────────────────
+       [5단계] 내 미디어 on/off 컨트롤
+         · 내가 스스로 내 카메라/마이크를 켜고 끈다.
+         · 입장 전에는 숨겨두고(display:none), 입장하면 JS 가 보이게 한다.
+       ──────────────────────────────────────────────────────────────── -->
+  <div id="mediaControls" style="display:none; margin-top:10px;">
+    <b>내 미디어:</b>
+    <button id="camBtn" onclick="toggleCamera()">📷 카메라 끄기</button>
+    <button id="micBtn" onclick="toggleMic()">🎤 마이크 끄기</button>
+  </div>
+
+  <!-- ────────────────────────────────────────────────────────────────
+       [5단계] 서버 강제 제어 (진행자/관리자 기능)
+         · 특정 참가자의 카메라/마이크를 "서버가 강제로" 끄거나 켠다.
+         · 실제 서비스라면 진행자만 보이게 해야 하지만, 학습용이라 항상 노출한다.
+       ──────────────────────────────────────────────────────────────── -->
+  <fieldset id="adminPanel" style="margin-top:14px; border:1px solid #d33; border-radius:8px;">
+    <legend style="color:#d33;">🛡️ 서버 강제 제어 (진행자 기능)</legend>
+    <p style="color:#666; font-size:13px; margin:4px 0 8px;">
+      다른 브라우저 탭으로 입장한 참가자의 <b>이름(identity)</b>을 적고,
+      그 사람의 카메라/마이크를 <b>서버가 강제로</b> 끄거나 켠다.<br/>
+      (우리 Spring 서버 → LiveKit <code>RoomServiceClient.mutePublishedTrack</code>)
+    </p>
+    대상 이름:
+    <input id="targetIdentity" size="10" placeholder="예: bob" />
+    대상 장치:
+    <select id="targetSource">
+      <option value="camera">카메라</option>
+      <option value="microphone">마이크</option>
+    </select>
+    <button onclick="forceMute(true)">강제 끄기(OFF)</button>
+    <button onclick="forceMute(false)">강제 켜기(ON)</button>
+    <div id="adminStatus" style="font-size:13px; color:#a40; margin-top:6px;"></div>
+  </fieldset>
+
   <div id="videos">
     <div class="cell">
       <!-- muted: 내 목소리가 내 스피커로 다시 나오는 하울링(에코) 방지 -->
@@ -117,7 +152,13 @@ async function join() {
     // 참가자가 방을 나갔을 때 → 그 사람 영상 칸을 통째로 지운다.
     .on(LivekitClient.RoomEvent.ParticipantDisconnected, (p) => removeCell(p.identity))
     // 내가 방에서 끊겼을 때 → UI 초기화.
-    .on(LivekitClient.RoomEvent.Disconnected, () => { setStatus('연결 종료됨'); document.getElementById('joinBtn').disabled = false; });
+    .on(LivekitClient.RoomEvent.Disconnected, () => { setStatus('연결 종료됨'); document.getElementById('joinBtn').disabled = false; })
+    // [5단계] 내 트랙이 mute/unmute 될 때마다 버튼 글자를 실제 상태에 맞춘다.
+    //   중요: "내가 버튼으로 끈 경우"뿐 아니라 "서버가 강제로 끈 경우"에도 이 이벤트가 뜬다!
+    //   → 서버가 강제 OFF 하면 LiveKit SDK 가 TrackMuted 를 발생시키고, 버튼이 "카메라 켜기"로 바뀐다.
+    //   (participant 가 나 자신일 때만 내 버튼을 갱신한다. 남이 mute 된 건 무시.)
+    .on(LivekitClient.RoomEvent.TrackMuted,   (pub, participant) => { if (participant === room.localParticipant) updateMediaButtons(); })
+    .on(LivekitClient.RoomEvent.TrackUnmuted, (pub, participant) => { if (participant === room.localParticipant) updateMediaButtons(); });
 
   // ── (4) 실제 접속! (여기서 시그널링·WebRTC 협상을 SDK 가 알아서 처리) ──
   setStatus('LiveKit 서버 접속 중…');
@@ -134,6 +175,78 @@ async function join() {
   if (camPub && camPub.track) {
     camPub.track.attach(document.getElementById('localVideo'));
   }
+
+  // ── (7) [5단계] 내 미디어 on/off 버튼을 보이게 하고, 현재 상태에 맞춰 글자를 세팅한다. ──
+  document.getElementById('mediaControls').style.display = 'block';
+  updateMediaButtons();
+}
+
+/* ----------------------------------------------------------------------------
+ * [5단계-A] 내 카메라/마이크 스스로 켜고 끄기
+ *
+ *   LiveKit 은 이 두 메서드로 내 장치를 제어한다(SDK 가 발행/중단을 알아서 처리):
+ *     · localParticipant.setCameraEnabled(true|false)
+ *     · localParticipant.setMicrophoneEnabled(true|false)
+ *   현재 켜짐 여부는 isCameraEnabled / isMicrophoneEnabled 로 읽는다.
+ * -------------------------------------------------------------------------- */
+function updateMediaButtons() {
+  if (!room) return;
+  const lp = room.localParticipant;
+  // isCameraEnabled 가 true 면 지금 켜져 있는 것 → 버튼은 "끄기"를 제시한다.
+  document.getElementById('camBtn').textContent =
+    lp.isCameraEnabled ? '📷 카메라 끄기' : '📷 카메라 켜기';
+  document.getElementById('micBtn').textContent =
+    lp.isMicrophoneEnabled ? '🎤 마이크 끄기' : '🎤 마이크 켜기';
+}
+
+async function toggleCamera() {
+  if (!room) return;
+  const lp = room.localParticipant;
+  // 지금 켜져 있으면 끄고, 꺼져 있으면 켠다.
+  await lp.setCameraEnabled(!lp.isCameraEnabled);
+
+  // 다시 켠 경우, 새로 만들어진 카메라 트랙을 내 로컬 미리보기에 재연결한다.
+  //   (껐다 켜면 트랙 객체가 새로 생길 수 있어서, 안 붙이면 내 화면이 검게 남는다.)
+  const camPub = lp.getTrackPublication(LivekitClient.Track.Source.Camera);
+  if (camPub && camPub.track) camPub.track.attach(document.getElementById('localVideo'));
+
+  updateMediaButtons();
+}
+
+async function toggleMic() {
+  if (!room) return;
+  const lp = room.localParticipant;
+  await lp.setMicrophoneEnabled(!lp.isMicrophoneEnabled);
+  updateMediaButtons();
+}
+
+/* ----------------------------------------------------------------------------
+ * [5단계-B] 서버 강제 제어 요청 (진행자 기능)
+ *
+ *   다른 참가자의 카메라/마이크를 "서버가 강제로" 끄거나 켠다.
+ *   실제 mute 는 우리 Spring 서버(LiveKitAdminController)가 LiveKit 서버에 명령해서 이뤄진다.
+ *   → 대상의 브라우저는 아무 코드도 안 짰지만, SDK 가 TrackMuted 이벤트를 받아 알아서 반영한다.
+ * -------------------------------------------------------------------------- */
+async function forceMute(muted) {
+  const targetIdentity = document.getElementById('targetIdentity').value.trim();
+  const source         = document.getElementById('targetSource').value;   // camera | microphone
+  const roomId         = document.getElementById('roomId').value.trim();
+  const adminStatus    = document.getElementById('adminStatus');
+
+  if (!targetIdentity) { adminStatus.textContent = '대상 이름(identity)을 입력하세요.'; return; }
+
+  // 우리 Spring 서버의 강제 제어 엔드포인트로 POST 요청(폼 파라미터 형식).
+  const params = new URLSearchParams({ room: roomId, identity: targetIdentity, source, muted });
+  const res = await fetch('/api/livekit/mute', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  });
+  const data = await res.json();
+
+  adminStatus.textContent = res.ok
+    ? `✅ 요청 성공: ${targetIdentity} 의 ${source} → 강제 ${muted ? 'OFF' : 'ON'}`
+    : `❌ 실패: ${data.error || ('HTTP ' + res.status)}`;
 }
 
 /* ----------------------------------------------------------------------------
@@ -191,6 +304,7 @@ async function leave() {
   // 남들 영상 칸 모두 제거 (내 로컬 칸은 남겨둔다)
   document.querySelectorAll('[id^="cell-"]').forEach((el) => el.remove());
   document.getElementById('localVideo').srcObject = null;
+  document.getElementById('mediaControls').style.display = 'none';  // [5단계] 미디어 버튼 숨김
   setStatus('퇴장 완료');
   document.getElementById('joinBtn').disabled = false;
 }
